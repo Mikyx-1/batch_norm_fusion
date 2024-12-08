@@ -43,7 +43,7 @@ cd batch_norm_fusion
 
 ### **1. Import the Library**
 ```python
-from batch_norm_fusion import fuse
+from fusion import fuse
 ```
 
 ### **2. Fuse Your Model**
