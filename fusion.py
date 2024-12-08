@@ -147,7 +147,7 @@ def fuse(model):
         nn.Module: A fused model with BatchNorm layers merged into Conv layers.
     """
     # Phase 1: Fusion (colored in green)
-    print(f"{Fore.GREEN}Phase 1 started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}Process started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}")
     
     fused_model = deepcopy(model)
     fuseable_layer_attributes = extract_layers_hierarchy(model)
@@ -168,116 +168,6 @@ def fuse(model):
         rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
         rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
 
-    print(f"Phase 1 completed: BatchNorm fusion finished. {params_reduced} parameters were reduced after fusion.")
-
-    # Phase 2: Similarity test (colored in blue)
-    print(f"{Fore.BLUE}Phase 2 started: Checking the fused model.{Style.RESET_ALL}")
-    run_similarity_test_with_progress(model, fused_model)  # Assuming this function provides its own progress updates
-    print(f"Phase 2 completed: Similarity test completed.")
+    print(f"Fusion completed: BatchNorm fusion finished. {params_reduced} parameters were reduced after fusion.")
 
     return fused_model
-
-def infer_input_from_model(model: nn.Module):
-    """
-    Infer the expected input shapes of a model, including models with multiple inputs.
-
-    Args:
-        model (nn.Module): The model whose input shape needs to be inferred.
-
-    Returns:
-        tuple or torch.Tensor: A tuple of input tensors for multiple inputs,
-        or a single tensor if the model has only one input.
-    """
-    # Inspect the forward method signature to find argument names and count
-    forward_sig = inspect.signature(model.forward)
-    param_names = list(forward_sig.parameters.keys())
-
-    # Exclude 'self' and 'kwargs'-like parameters
-    param_names = [
-        name for name in param_names
-        if name != 'self' and forward_sig.parameters[name].kind != inspect.Parameter.VAR_KEYWORD
-    ]
-
-    if not param_names:
-        raise ValueError("Unable to infer input: no valid parameters found in the forward method.")
-
-    # Assume the default shape for each input is (1, 3, 224, 224)
-    # This can be adjusted based on your domain knowledge
-    example_inputs = []
-    for param in param_names:
-        default_shape = (1, 3, 224, 224)  # Assumes image input for each tensor
-        example_inputs.append(torch.randn(*default_shape))
-
-    # Convert to a tuple if multiple inputs, otherwise return a single tensor
-    return tuple(example_inputs) if len(example_inputs) > 1 else example_inputs[0]
-
-
-@torch.no_grad()
-def run_similarity_test_with_progress(model, fused_model, iterations: int = 10):
-    """
-    Run similarity tests between the original and fused models with a progress bar
-    and measure inference speed.
-
-    Args:
-        model (nn.Module): Original model.
-        fused_model (nn.Module): Fused model.
-        iterations (int): Number of iterations for testing.
-    """
-    model.eval()
-    fused_model.eval()
-    print("Inferring input from the model...")
-    input_sample = infer_input_from_model(model)
-    print(f"Inferred input: {[tuple(inp.shape) for inp in input_sample] if isinstance(input_sample, tuple) else input_sample.shape}")
-
-    # Progress bar for iterations
-    tol = 1e-2
-    differences = []
-    model_times = []
-    fused_model_times = []
-
-    with tqdm(total=iterations, desc="Running similarity test") as pbar:
-        for _ in range(iterations):
-            # Generate random input based on inferred shapes
-            if isinstance(input_sample, tuple):
-                sample = tuple(torch.randn_like(inp) for inp in input_sample)
-            else:
-                sample = torch.randn_like(input_sample)
-
-            # Measure original model inference time
-            start_time = time.time()
-            if isinstance(input_sample, tuple):
-                model_res = model(*sample)  # Unpack for multiple inputs
-            else:
-                model_res = model(sample)
-            model_times.append(time.time() - start_time)
-
-            # Measure fused model inference time
-            start_time = time.time()
-            if isinstance(input_sample, tuple):
-                fused_res = fused_model(*sample)
-            else:
-                fused_res = fused_model(sample)
-            fused_model_times.append(time.time() - start_time)
-
-            # Compute difference
-            difference = torch.linalg.norm(model_res - fused_res)
-            differences.append(difference.item())
-            pbar.update(1)
-
-    # Compute average inference times
-    avg_model_time = sum(model_times) / iterations
-    avg_fused_model_time = sum(fused_model_times) / iterations
-    speedup = (avg_model_time - avg_fused_model_time) / avg_model_time * 100
-
-    # Report results
-    max_diff = max(differences)
-    print(f"\nMaximum difference: {max_diff}")
-    if max_diff > tol:
-        print(f"WARNING: Difference exceeds tolerance of {tol}")
-    else:
-        print("Models are within tolerance!")
-
-    # Report speedup
-    print(f"Average inference time (original model): {avg_model_time:.6f} seconds")
-    print(f"Average inference time (fused model): {avg_fused_model_time:.6f} seconds")
-    print(f"Fused model is {speedup:.2f}% faster than the original model.")
