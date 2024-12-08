@@ -137,5 +137,5 @@ For questions or collaboration, feel free to reach out:
 
 ---
 
-Thank you for supporting the community by optimizing deep learning models!
+Thank you for supporting the community by optimising deep learning models!
 
