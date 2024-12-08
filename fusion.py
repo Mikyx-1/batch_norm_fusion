@@ -3,9 +3,9 @@
 # Date: December 8th, 2024
 # Description: 
 #     This script fuses BatchNorm layers into Conv layers for 
-#     deep learning models in PyTorch, optimizing them for inference.
-# GitHub: https://github.com/Mikyx-1 (if applicable)
-# License: MIT License (if applicable)
+#     deep learning models in PyTorch, optimising them for inference.
+# GitHub: https://github.com/Mikyx-1/batch_norm_fusion
+# License: MIT License
 # ------------------------------------------------------------
 
 
