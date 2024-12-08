@@ -16,6 +16,7 @@ from copy import deepcopy
 from tqdm import tqdm
 import inspect
 import time
+from colorama import Fore, Style
 
 def fuse_conv_and_bn(conv, bn):
     """
@@ -145,6 +146,9 @@ def fuse(model):
     Returns:
         nn.Module: A fused model with BatchNorm layers merged into Conv layers.
     """
+    # Phase 1: Fusion (colored in green)
+    print(f"{Fore.GREEN}Phase 1 started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}")
+    
     fused_model = deepcopy(model)
     fuseable_layer_attributes = extract_layers_hierarchy(model)
 
@@ -164,7 +168,13 @@ def fuse(model):
         rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
         rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
 
-    print(f"BatchNorm fusion completed. {params_reduced} parameters were reduced after fusion.")
+    print(f"Phase 1 completed: BatchNorm fusion finished. {params_reduced} parameters were reduced after fusion.")
+
+    # Phase 2: Similarity test (colored in blue)
+    print(f"{Fore.BLUE}Phase 2 started: Checking the fused model.{Style.RESET_ALL}")
+    run_similarity_test_with_progress(model, fused_model)  # Assuming this function provides its own progress updates
+    print(f"Phase 2 completed: Similarity test completed.")
+
     return fused_model
 
 def infer_input_from_model(model: nn.Module):
