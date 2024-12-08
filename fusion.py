@@ -6,6 +6,7 @@ import functools
 from copy import deepcopy
 from tqdm import tqdm
 import inspect
+import time
 
 def fuse_conv_and_bn(conv, bn):
     """
@@ -124,34 +125,36 @@ def rgetattr(obj, attr, *args):
         return getattr(obj, attr, *args)
     return functools.reduce(_getattr, [obj] + attr.split('.'))
 
-# @torch.no_grad()
-# def fuse(model):
-#     fused_model = deepcopy(model)
-#     fuseable_layer_attributes = extract_layers_hierarchy(model)
-#     for fuseable_layer_attribute in fuseable_layer_attributes:
-#         conv_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[0])
-#         bn_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[1])
-#         if isinstance(bn_layer, nn.Identity):
-#             continue
-#         fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
-#         rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
-#         rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
-#     return fused_model
-
 @torch.no_grad()
 def fuse(model):
+    """
+    Fuses BatchNorm layers into Conv layers for a given model.
+    
+    Args:
+        model (nn.Module): The original model to be fused.
+    
+    Returns:
+        nn.Module: A fused model with BatchNorm layers merged into Conv layers.
+    """
     fused_model = deepcopy(model)
     fuseable_layer_attributes = extract_layers_hierarchy(model)
+
+    total_params_before = sum(p.numel() for p in fused_model.parameters())
 
     for fuseable_layer_attribute in tqdm(fuseable_layer_attributes, desc="Fusing Layers"):
         conv_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[0])
         bn_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[1])
         if isinstance(bn_layer, nn.Identity):
             continue
+        # Fuse conv and bn layers
         fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
         rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
         rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
 
+    total_params_after = sum(p.numel() for p in fused_model.parameters())
+    params_reduced = total_params_before - total_params_after
+
+    print(f"BatchNorm fusion completed. {params_reduced} parameters were reduced after fusion.")
     return fused_model
 
 def infer_input_from_model(model: nn.Module):
@@ -192,7 +195,8 @@ def infer_input_from_model(model: nn.Module):
 @torch.no_grad()
 def run_similarity_test_with_progress(model, fused_model, iterations: int = 10):
     """
-    Run similarity tests between the original and fused models with a progress bar.
+    Run similarity tests between the original and fused models with a progress bar
+    and measure inference speed.
 
     Args:
         model (nn.Module): Original model.
@@ -208,26 +212,52 @@ def run_similarity_test_with_progress(model, fused_model, iterations: int = 10):
     # Progress bar for iterations
     tol = 1e-2
     differences = []
+    model_times = []
+    fused_model_times = []
+
     with tqdm(total=iterations, desc="Running similarity test") as pbar:
         for _ in range(iterations):
             # Generate random input based on inferred shapes
             if isinstance(input_sample, tuple):
                 sample = tuple(torch.randn_like(inp) for inp in input_sample)
-                model_res = model(*sample)  # Unpack for multiple inputs
-                fused_res = fused_model(*sample)
             else:
                 sample = torch.randn_like(input_sample)
-                model_res = model(sample)
-                fused_res = fused_model(sample)
 
+            # Measure original model inference time
+            start_time = time.time()
+            if isinstance(input_sample, tuple):
+                model_res = model(*sample)  # Unpack for multiple inputs
+            else:
+                model_res = model(sample)
+            model_times.append(time.time() - start_time)
+
+            # Measure fused model inference time
+            start_time = time.time()
+            if isinstance(input_sample, tuple):
+                fused_res = fused_model(*sample)
+            else:
+                fused_res = fused_model(sample)
+            fused_model_times.append(time.time() - start_time)
+
+            # Compute difference
             difference = torch.linalg.norm(model_res - fused_res)
             differences.append(difference.item())
             pbar.update(1)
 
+    # Compute average inference times
+    avg_model_time = sum(model_times) / iterations
+    avg_fused_model_time = sum(fused_model_times) / iterations
+    speedup = (avg_model_time - avg_fused_model_time) / avg_model_time * 100
+
     # Report results
     max_diff = max(differences)
-    print(f"Maximum difference: {max_diff}")
+    print(f"\nMaximum difference: {max_diff}")
     if max_diff > tol:
         print(f"WARNING: Difference exceeds tolerance of {tol}")
     else:
         print("Models are within tolerance!")
+
+    # Report speedup
+    print(f"Average inference time (original model): {avg_model_time:.6f} seconds")
+    print(f"Average inference time (fused model): {avg_fused_model_time:.6f} seconds")
+    print(f"Fused model is {speedup:.2f}% faster than the original model.")
