@@ -1,7 +1,16 @@
-from bisenet import BiSeNet
+# ------------------------------------------------------------
+# Author: Viet Hoang Le (Mikyx-1)
+# Date: December 8th, 2024
+# Description: 
+#     This script fuses BatchNorm layers into Conv layers for 
+#     deep learning models in PyTorch, optimizing them for inference.
+# GitHub: https://github.com/Mikyx-1 (if applicable)
+# License: MIT License (if applicable)
+# ------------------------------------------------------------
+
+
 import torch
 from torch import nn
-import torchvision
 import functools
 from copy import deepcopy
 from tqdm import tqdm
@@ -139,7 +148,7 @@ def fuse(model):
     fused_model = deepcopy(model)
     fuseable_layer_attributes = extract_layers_hierarchy(model)
 
-    total_params_before = sum(p.numel() for p in fused_model.parameters())
+    params_reduced = 0
 
     for fuseable_layer_attribute in tqdm(fuseable_layer_attributes, desc="Fusing Layers"):
         conv_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[0])
@@ -148,11 +157,12 @@ def fuse(model):
             continue
         # Fuse conv and bn layers
         fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
+        num_conv_params = sum(p.numel() for p in conv_layer.parameters())
+        num_bn_params = sum(p.numel() for p in bn_layer.parameters())
+        num_fused_params = sum(p.numel() for p in fused_layer.parameters())
+        params_reduced += num_conv_params + num_bn_params - num_fused_params
         rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
         rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
-
-    total_params_after = sum(p.numel() for p in fused_model.parameters())
-    params_reduced = total_params_before - total_params_after
 
     print(f"BatchNorm fusion completed. {params_reduced} parameters were reduced after fusion.")
     return fused_model
