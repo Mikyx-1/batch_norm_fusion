@@ -135,7 +135,3 @@ For questions or collaboration, feel free to reach out:
 - GitHub: [Mikyx-1](https://github.com/Mikyx-1)
 - Email: lehoangviet2k@gmail.com
 
----
-
-Thank you for supporting the community by optimising deep learning models!
-
