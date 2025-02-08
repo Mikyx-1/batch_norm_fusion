@@ -14,8 +14,6 @@ from torch import nn
 import functools
 from copy import deepcopy
 from tqdm import tqdm
-import inspect
-import time
 from colorama import Fore, Style
 
 def fuse_conv_and_bn(conv, bn):
@@ -71,50 +69,25 @@ def fuse_conv_and_bn(conv, bn):
 
     return fusedconv
 
-def extract_layers_hierarchy(module, prefix="", depth=0):
-    """
-    Recursively extract layers from a PyTorch module, grouping Conv2d and BatchNorm2d layers.
 
-    Args:
-        module (nn.Module): The PyTorch model or submodule.
-        prefix (str): Prefix for naming layers to include parent module hierarchy.
-        depth (int): Current depth of recursion, used for debugging or hierarchy tracking.
+def find_conv_bn_pairs(traced_model):
+    conv_bn_pairs = []
+    prev_node = None
+    module_dict = dict(traced_model.named_modules())  # Get all modules with proper dot-separated names
 
-    Returns:
-        list: List of grouped Conv2d and BatchNorm2d layers in order.
-    """
-    layers = []
-    prev_conv = None
+    for node in traced_model.graph.nodes:
+        if node.op == 'call_module':
+            module = module_dict[node.target]
+            if isinstance(module, nn.Conv2d):
+                prev_node = node
+            elif isinstance(module, nn.BatchNorm2d) and prev_node:
+                # Use the full dot-separated module names
+                conv_name = node.target  # Already in dot notation
+                bn_name = prev_node.target  # Already in dot notation
+                conv_bn_pairs.append((bn_name, conv_name))  # Keep order (conv, bn)
+                prev_node = None
+    return conv_bn_pairs
 
-    for name, submodule in module.named_children():
-        full_name = f"{prefix}{name}" if prefix else name
-
-        if len(list(submodule.children())) > 0:  # Check if the submodule has children
-            # Recursively extract from children modules
-            layers.extend(extract_layers_hierarchy(submodule, prefix=f"{full_name}.", depth=depth + 1))
-        else:
-            # Check if the current layer is Conv2d or BatchNorm2d
-            layer_type = type(submodule).__name__
-            if layer_type == "Conv2d":
-                prev_conv = full_name  # Store the Conv2d layer temporarily
-            elif layer_type == "BatchNorm2d" and prev_conv:
-                # If a BatchNorm2d follows a Conv2d, group them
-                layers.append([prev_conv, full_name])
-                prev_conv = None
-            else:
-                # Reset if a Conv2d is not followed by BatchNorm2d
-                prev_conv = None
-
-    return layers
-
-def check_nested_hasattr(obj: object, attr_path: str):
-    try:
-        attrs = attr_path.split(".")
-        for attr in attrs:
-            obj = getattr(obj, attr)
-        return True
-    except AttributeError:
-        return False
     
 def get_layer_by_path(model, layer_path):
     attrs = layer_path.split(".")
@@ -135,6 +108,7 @@ def rgetattr(obj, attr, *args):
         return getattr(obj, attr, *args)
     return functools.reduce(_getattr, [obj] + attr.split('.'))
 
+
 @torch.no_grad()
 def fuse(model):
     """
@@ -150,24 +124,36 @@ def fuse(model):
     print(f"{Fore.GREEN}Process started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}")
     
     fused_model = deepcopy(model)
-    fuseable_layer_attributes = extract_layers_hierarchy(model)
-
+    fused_model.eval()
+    traced = torch.fx.symbolic_trace(fused_model) 
+    fuseable_layer_attributes = find_conv_bn_pairs(traced)  # Get conv-bn pairs
     params_reduced = 0
 
-    for fuseable_layer_attribute in tqdm(fuseable_layer_attributes, desc="Fusing Layers"):
-        conv_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[0])
-        bn_layer = get_layer_by_path(fused_model, fuseable_layer_attribute[1])
-        if isinstance(bn_layer, nn.Identity):
-            continue
-        # Fuse conv and bn layers
-        fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
-        num_conv_params = sum(p.numel() for p in conv_layer.parameters())
-        num_bn_params = sum(p.numel() for p in bn_layer.parameters())
-        num_fused_params = sum(p.numel() for p in fused_layer.parameters())
-        params_reduced += num_conv_params + num_bn_params - num_fused_params
-        rsetattr(fused_model, fuseable_layer_attribute[0], fused_layer)
-        rsetattr(fused_model, fuseable_layer_attribute[1], nn.Identity())
+    for conv_name, bn_name in tqdm(fuseable_layer_attributes, desc="Fusing Layers"):
+        try:
+            conv_layer = get_layer_by_path(fused_model, conv_name)
+            bn_layer = get_layer_by_path(fused_model, bn_name)
+            
+            if isinstance(bn_layer, nn.Identity):
+                continue  # Already fused
 
-    print(f"Fusion completed: BatchNorm fusion finished. {params_reduced} parameters were reduced after fusion.")
+            # Fuse conv and bn layers
+            fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
+
+            # Count parameter reduction
+            num_conv_params = sum(p.numel() for p in conv_layer.parameters())
+            num_bn_params = sum(p.numel() for p in bn_layer.parameters())
+            num_fused_params = sum(p.numel() for p in fused_layer.parameters())
+            params_reduced += num_conv_params + num_bn_params - num_fused_params
+
+            # Replace layers
+            rsetattr(fused_model, conv_name, fused_layer)
+            rsetattr(fused_model, bn_name, nn.Identity())  # Remove BN after fusion
+            
+        except Exception as e:
+            print(f"{Fore.YELLOW}Error fusing {conv_name} and {bn_name}: {e}. The code will skip fusing these layers.{Style.RESET_ALL}")
+            continue
+
+    print(f"Fusion completed: {Fore.GREEN}{params_reduced} parameters reduced after fusion.{Style.RESET_ALL}")
 
     return fused_model
