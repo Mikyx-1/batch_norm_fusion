@@ -29,6 +29,41 @@ This script is designed for the deep learning community, addressing the need for
 
 ---
 
+## ⚠️ Warning & Precision Considerations  
+
+BatchNorm fusion may introduce **small numerical differences** at every fusion step due to floating-point precision changes. These small errors can **accumulate**, leading to noticeable deviations in the final model output, especially in deeper networks.  
+
+### **Recommended Steps to Validate Your Model:**  
+
+#### **1. Compare Model Outputs Before and After Fusion**  
+
+Use the following code to measure the relative error between the original and fused model outputs:  
+
+```python
+import torch
+
+# Example input tensor
+input_tensor = torch.randn(1, 3, 224, 224)  # Adjust shape based on your model's input
+
+# Get outputs before and after fusion
+orig_out = model(input_tensor)
+fused_out = fused_model(input_tensor)
+
+# Compute relative error
+relative_error = torch.norm(orig_out - fused_out) / torch.norm(orig_out)
+print(f"Relative Error: {relative_error.item():.6f}")
+```
+
+#### 2. **Test on a Validation Dataset**
+
+Run inference on a validation set and compare the accuracy before and after fusion.
+
+#### 3. **If Necessary, Adjust BatchNorm Parameters**
+
+If precision is critical, consider adjusting eps values in BatchNorm layers or retaining BatchNorm layers selectively.
+
+➡ **Always verify fusion results before deploying the fused model into production!**
+
 ## **Installation**
 Clone the repository:
 
