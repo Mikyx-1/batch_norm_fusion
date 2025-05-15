@@ -1,20 +1,20 @@
 # ------------------------------------------------------------
 # Author: Viet Hoang Le (Mikyx-1)
 # Date: December 8th, 2024
-# Description: 
-#     This script fuses BatchNorm layers into Conv layers for 
-#     deep learning models in PyTorch, optimising them for inference.
+# Description:
+# This script fuses BatchNorm layers into Conv layers for
+# deep learning models in PyTorch, optimising them for inference.
 # GitHub: https://github.com/Mikyx-1/batch_norm_fusion
 # License: MIT License
 # ------------------------------------------------------------
-
-
-import torch
-from torch import nn
 import functools
 from copy import deepcopy
-from tqdm import tqdm
+
+import torch
 from colorama import Fore, Style
+from torch import nn
+from tqdm import tqdm
+
 
 def fuse_conv_and_bn(conv, bn):
     """
@@ -28,7 +28,16 @@ def fuse_conv_and_bn(conv, bn):
     Returns:
         torch.nn.Conv2d: The fused convolutional layer.
     """
-    # Initialize the fused convolution layer
+    # Try PyTorch's built-in fusion for standard convolutions
+    if conv.groups == 1:
+        try:
+            from torch.nn.utils import fuse_conv_bn_eval
+
+            return fuse_conv_bn_eval(conv, bn)
+        except ImportError:
+            pass  # Fall back to custom fusion if utility is unavailable
+
+    # Custom fusion for grouped convolutions or if PyTorch utility fails
     fusedconv = torch.nn.Conv2d(
         in_channels=conv.in_channels,
         out_channels=conv.out_channels,
@@ -36,60 +45,107 @@ def fuse_conv_and_bn(conv, bn):
         stride=conv.stride,
         padding=conv.padding,
         dilation=conv.dilation,
-        groups=conv.groups,  # Preserve groups for grouped convolutions
-        bias=True  # Always use bias in the fused layer
+        groups=conv.groups,
+        bias=True,
+    ).to(
+        dtype=torch.float64
+    )  # Use double precision
+
+    w_conv = conv.weight.clone().to(dtype=torch.float64)
+    if conv.groups > 1:
+        # Process grouped convolutions group-wise
+        fused_weight = torch.zeros_like(w_conv, dtype=torch.float64)
+        group_size = conv.out_channels // conv.groups
+        for g in range(conv.groups):
+            w_conv_g = w_conv[g * group_size : (g + 1) * group_size]
+            w_bn_g = torch.diag(
+                bn.weight[g * group_size : (g + 1) * group_size]
+                .to(dtype=torch.float64)
+                .div(
+                    torch.sqrt(
+                        bn.running_var[g * group_size : (g + 1) * group_size].to(
+                            dtype=torch.float64
+                        )
+                        + bn.eps
+                        + 1e-4
+                    )
+                )
+            )
+            fused_weight[g * group_size : (g + 1) * group_size] = torch.mm(
+                w_bn_g, w_conv_g.view(group_size, -1)
+            ).view_as(w_conv_g)
+    else:
+        # Regular convolution
+        w_bn = torch.diag(
+            bn.weight.to(dtype=torch.float64).div(
+                torch.sqrt(bn.running_var.to(dtype=torch.float64) + bn.eps + 1e-4)
+            )
+        )
+        fused_weight = torch.mm(w_bn, w_conv.view(conv.out_channels, -1)).view(
+            fusedconv.weight.size()
+        )
+
+    fusedconv.weight.copy_(
+        fused_weight.to(dtype=torch.float32)
+    )  # Convert back to float32
+
+    if conv.bias is not None:
+        b_conv = conv.bias.clone().to(dtype=torch.float64)
+    else:
+        b_conv = torch.zeros(
+            conv.out_channels, device=conv.weight.device, dtype=torch.float64
+        )
+
+    b_bn = bn.bias.to(dtype=torch.float64) - bn.weight.to(dtype=torch.float64).mul(
+        bn.running_mean.to(dtype=torch.float64)
+    ).div(torch.sqrt(bn.running_var.to(dtype=torch.float64) + bn.eps + 1e-4))
+    fusedconv.bias.copy_(
+        (torch.matmul(w_bn, b_conv.unsqueeze(1)).squeeze() + b_bn).to(
+            dtype=torch.float32
+        )
     )
 
-    # Prepare convolution weights
-    w_conv = conv.weight.clone()
-    if conv.groups > 1:
-        # For grouped convolutions, process weights group-wise
-        w_conv = w_conv.view(conv.groups, -1, w_conv.size(1), w_conv.size(2), w_conv.size(3))  # Grouped view
-        w_conv = w_conv.reshape(conv.out_channels, -1)  # Flatten across groups
-    else:
-        # For regular convolutions, flatten weights directly
-        w_conv = w_conv.view(conv.out_channels, -1)
-
-    # Compute the BN scaling factors
-    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
-
-    # Apply the scaling factor to the convolution weights
-    fused_weight = torch.mm(w_bn, w_conv)
-    fused_weight = fused_weight.view(fusedconv.weight.size())  # Reshape to original Conv2d weight shape
-    fusedconv.weight.copy_(fused_weight)
-
-    # Prepare spatial bias
-    if conv.bias is not None:
-        b_conv = conv.bias.clone()
-    else:
-        b_conv = torch.zeros(conv.out_channels, device=conv.weight.device)
-
-    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
-    fusedconv.bias.copy_(torch.matmul(w_bn, b_conv.unsqueeze(1)).squeeze() + b_bn)
-
-    return fusedconv
+    return fusedconv.to(dtype=torch.float32)
 
 
 def find_conv_bn_pairs(traced_model):
+    """
+    Identifies Conv2d-BatchNorm2d pairs in a traced model.
+
+    Args:
+        traced_model: The symbolically traced PyTorch model.
+
+    Returns:
+        list: List of tuples (conv_name, bn_name) for Conv-BN pairs.
+    """
     conv_bn_pairs = []
     prev_node = None
-    module_dict = dict(traced_model.named_modules())  # Get all modules with proper dot-separated names
+    module_dict = dict(traced_model.named_modules())
 
     for node in traced_model.graph.nodes:
-        if node.op == 'call_module':
+        if node.op == "call_module":
             module = module_dict[node.target]
             if isinstance(module, nn.Conv2d):
                 prev_node = node
             elif isinstance(module, nn.BatchNorm2d) and prev_node:
-                # Use the full dot-separated module names
-                conv_name = node.target  # Already in dot notation
-                bn_name = prev_node.target  # Already in dot notation
-                conv_bn_pairs.append((bn_name, conv_name))  # Keep order (conv, bn)
+                conv_name = prev_node.target
+                bn_name = node.target
+                conv_bn_pairs.append((conv_name, bn_name))
                 prev_node = None
     return conv_bn_pairs
 
-    
+
 def get_layer_by_path(model, layer_path):
+    """
+    Retrieves a layer from a model using a dot-separated path.
+
+    Args:
+        model (nn.Module): The model.
+        layer_path (str): Dot-separated path to the layer.
+
+    Returns:
+        nn.Module: The requested layer.
+    """
     attrs = layer_path.split(".")
     layer = model
     for attr in attrs:
@@ -99,61 +155,116 @@ def get_layer_by_path(model, layer_path):
             layer = getattr(layer, attr)
     return layer
 
+
 def rsetattr(obj, attr, val):
-    pre, _, post = attr.rpartition('.')
+    """
+    Sets an attribute on an object using a dot-separated path.
+
+    Args:
+        obj: The object.
+        attr (str): Dot-separated attribute path.
+        val: Value to set.
+    """
+    pre, _, post = attr.rpartition(".")
     return setattr(rgetattr(obj, pre) if pre else obj, post, val)
 
+
 def rgetattr(obj, attr, *args):
+    """
+    Gets an attribute from an object using a dot-separated path.
+
+    Args:
+        obj: The object.
+        attr (str): Dot-separated attribute path.
+
+    Returns:
+        The requested attribute.
+    """
+
     def _getattr(obj, attr):
         return getattr(obj, attr, *args)
-    return functools.reduce(_getattr, [obj] + attr.split('.'))
+
+    return functools.reduce(_getattr, [obj] + attr.split("."))
 
 
 @torch.no_grad()
 def fuse(model):
     """
     Fuses BatchNorm layers into Conv layers for a given model.
-    
+
     Args:
         model (nn.Module): The original model to be fused.
-    
+
     Returns:
         nn.Module: A fused model with BatchNorm layers merged into Conv layers.
     """
-    # Phase 1: Fusion (colored in green)
-    print(f"{Fore.GREEN}Process started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}")
-    
+    # Stabilize BN statistics
+    model.eval()
+    device = next(model.parameters()).device
+    for _ in range(10):
+        model(torch.randn(1, 3, 224, 224, device=device))
+
+    print(
+        f"{Fore.GREEN}Process started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}"
+    )
     fused_model = deepcopy(model)
     fused_model.eval()
-    traced = torch.fx.symbolic_trace(fused_model) 
-    fuseable_layer_attributes = find_conv_bn_pairs(traced)  # Get conv-bn pairs
+    traced = torch.fx.symbolic_trace(fused_model)
+    fuseable_layer_attributes = find_conv_bn_pairs(traced)
     params_reduced = 0
 
     for conv_name, bn_name in tqdm(fuseable_layer_attributes, desc="Fusing Layers"):
         try:
             conv_layer = get_layer_by_path(fused_model, conv_name)
             bn_layer = get_layer_by_path(fused_model, bn_name)
-            
             if isinstance(bn_layer, nn.Identity):
-                continue  # Already fused
+                continue
 
-            # Fuse conv and bn layers
+            # Validate fusion for this layer
+            test_input = torch.randn(
+                1, conv_layer.in_channels, 32, 32, device=conv_layer.weight.device
+            )
+            original_output = bn_layer(conv_layer(test_input))
             fused_layer = fuse_conv_and_bn(conv_layer, bn_layer)
+            fused_output = fused_layer(test_input)
+            diff = torch.linalg.norm(original_output - fused_output)
+            if diff > 1e-3:
+                print(
+                    f"{Fore.YELLOW}Warning: Large difference ({diff:.6f}) for {conv_name} and {bn_name}{Style.RESET_ALL}"
+                )
 
-            # Count parameter reduction
             num_conv_params = sum(p.numel() for p in conv_layer.parameters())
             num_bn_params = sum(p.numel() for p in bn_layer.parameters())
             num_fused_params = sum(p.numel() for p in fused_layer.parameters())
             params_reduced += num_conv_params + num_bn_params - num_fused_params
 
-            # Replace layers
             rsetattr(fused_model, conv_name, fused_layer)
-            rsetattr(fused_model, bn_name, nn.Identity())  # Remove BN after fusion
-            
+            rsetattr(fused_model, bn_name, nn.Identity())
         except Exception as e:
-            print(f"{Fore.YELLOW}Error fusing {conv_name} and {bn_name}: {e}. The code will skip fusing these layers.{Style.RESET_ALL}")
+            print(
+                f"{Fore.YELLOW}Error fusing {conv_name} and {bn_name}: {e}. Skipping.{Style.RESET_ALL}"
+            )
             continue
 
-    print(f"Fusion completed: {Fore.GREEN}{params_reduced} parameters reduced after fusion.{Style.RESET_ALL}")
-
+    print(
+        f"Fusion completed: {Fore.GREEN}{params_reduced} parameters reduced after fusion.{Style.RESET_ALL}"
+    )
     return fused_model
+
+
+# Example usage
+if __name__ == "__main__":
+    import torchvision.models
+
+    model = torchvision.models.resnet152(pretrained=False)
+    model.eval()
+    fused_model = fuse(model)
+    fused_model.eval()
+
+    dummy = torch.randn((1, 3, 224, 224))
+    res1 = model(dummy)
+    res2 = fused_model(dummy)
+    output_difference = torch.linalg.norm(res1 - res2)
+    relative_difference = output_difference / torch.linalg.norm(res1)
+    print(f"Output difference after fusion: {output_difference}")
+    print(f"Relative output difference after fusion: {relative_difference}")
