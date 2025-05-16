@@ -168,10 +168,18 @@ def main():
         fused_outputs_large = fused_layer(train_inputs_large)
         val_fused_small = fused_layer(val_inputs_small)
         val_fused_large = fused_layer(val_inputs_large)
-    diff_before_small = torch.linalg.norm(original_outputs_small - fused_outputs_small)
-    diff_before_large = torch.linalg.norm(original_outputs_large - fused_outputs_large)
-    val_diff_before_small = torch.linalg.norm(val_original_small - val_fused_small)
-    val_diff_before_large = torch.linalg.norm(val_original_large - val_fused_large)
+    diff_before_small = (
+        torch.linalg.norm(original_outputs_small - fused_outputs_small) / batch_size
+    )
+    diff_before_large = (
+        torch.linalg.norm(original_outputs_large - fused_outputs_large) / batch_size
+    )
+    val_diff_before_small = (
+        torch.linalg.norm(val_original_small - val_fused_small) / batch_size
+    )
+    val_diff_before_large = (
+        torch.linalg.norm(val_original_large - val_fused_large) / batch_size
+    )
     print(f"Train difference before optimization (16x16): {diff_before_small:.6f}")
     print(f"Train difference before optimization (224x224): {diff_before_large:.6f}")
     print(f"Val difference before optimization (16x16): {val_diff_before_small:.6f}")
@@ -193,12 +201,18 @@ def main():
     def closure():
         optimizer.zero_grad()
         fused_outputs = fused_layer(train_inputs_small)
-        fused_outputs_norm = fused_outputs / (
-            fused_outputs.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+        # Compute L2 norm per sample across channels, height, width
+        fused_norm = (
+            torch.sqrt(torch.sum(fused_outputs**2, dim=(1, 2, 3), keepdim=True)) + 1e-10
         )
-        original_outputs_norm = original_outputs_small / (
-            original_outputs_small.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+        fused_outputs_norm = fused_outputs / fused_norm
+        original_norm = (
+            torch.sqrt(
+                torch.sum(original_outputs_small**2, dim=(1, 2, 3), keepdim=True)
+            )
+            + 1e-10
         )
+        original_outputs_norm = original_outputs_small / original_norm
         loss_output = (
             torch.linalg.norm(fused_outputs_norm - original_outputs_norm) / batch_size
         )
@@ -213,12 +227,18 @@ def main():
         optimizer.step(closure)
         with torch.no_grad():
             fused_outputs = fused_layer(train_inputs_small)
-            fused_outputs_norm = fused_outputs / (
-                fused_outputs.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+            fused_norm = (
+                torch.sqrt(torch.sum(fused_outputs**2, dim=(1, 2, 3), keepdim=True))
+                + 1e-10
             )
-            original_outputs_norm = original_outputs_small / (
-                original_outputs_small.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+            fused_outputs_norm = fused_outputs / fused_norm
+            original_norm = (
+                torch.sqrt(
+                    torch.sum(original_outputs_small**2, dim=(1, 2, 3), keepdim=True)
+                )
+                + 1e-10
             )
+            original_outputs_norm = original_outputs_small / original_norm
             loss_output = (
                 torch.linalg.norm(fused_outputs_norm - original_outputs_norm)
                 / batch_size
