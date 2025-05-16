@@ -112,10 +112,11 @@ def main():
     model = ConvBNModel().eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    model.to(dtype=torch.float64)  # Convert model parameters to float64
 
     # Stabilize BN with normalized inputs
     for _ in range(100):
-        input_tensor = torch.randn(64, 3, 16, 16, device=device)
+        input_tensor = torch.randn(64, 3, 16, 16, device=device, dtype=torch.float64)
         input_tensor = input_tensor / (
             torch.amax(input_tensor.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
         )
@@ -123,21 +124,29 @@ def main():
 
     # Create training batch
     batch_size = 64
-    train_inputs_small = torch.randn(batch_size, 3, 16, 16, device=device)
+    train_inputs_small = torch.randn(
+        batch_size, 3, 16, 16, device=device, dtype=torch.float64
+    )
     train_inputs_small = train_inputs_small / (
         torch.amax(train_inputs_small.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
     )
-    train_inputs_large = torch.randn(batch_size, 3, 224, 224, device=device)
+    train_inputs_large = torch.randn(
+        batch_size, 3, 224, 224, device=device, dtype=torch.float64
+    )
     train_inputs_large = train_inputs_large / (
         torch.amax(train_inputs_large.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
     )
 
     # Create validation batch
-    val_inputs_small = torch.randn(batch_size, 3, 16, 16, device=device)
+    val_inputs_small = torch.randn(
+        batch_size, 3, 16, 16, device=device, dtype=torch.float64
+    )
     val_inputs_small = val_inputs_small / (
         torch.amax(val_inputs_small.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
     )
-    val_inputs_large = torch.randn(batch_size, 3, 224, 224, device=device)
+    val_inputs_large = torch.randn(
+        batch_size, 3, 224, 224, device=device, dtype=torch.float64
+    )
     val_inputs_large = val_inputs_large / (
         torch.amax(val_inputs_large.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
     )
@@ -159,18 +168,10 @@ def main():
         fused_outputs_large = fused_layer(train_inputs_large)
         val_fused_small = fused_layer(val_inputs_small)
         val_fused_large = fused_layer(val_inputs_large)
-    diff_before_small = (
-        torch.linalg.norm(original_outputs_small - fused_outputs_small) / batch_size
-    )
-    diff_before_large = (
-        torch.linalg.norm(original_outputs_large - fused_outputs_large) / batch_size
-    )
-    val_diff_before_small = (
-        torch.linalg.norm(val_original_small - val_fused_small) / batch_size
-    )
-    val_diff_before_large = (
-        torch.linalg.norm(val_original_large - val_fused_large) / batch_size
-    )
+    diff_before_small = torch.linalg.norm(original_outputs_small - fused_outputs_small)
+    diff_before_large = torch.linalg.norm(original_outputs_large - fused_outputs_large)
+    val_diff_before_small = torch.linalg.norm(val_original_small - val_fused_small)
+    val_diff_before_large = torch.linalg.norm(val_original_large - val_fused_large)
     print(f"Train difference before optimization (16x16): {diff_before_small:.6f}")
     print(f"Train difference before optimization (224x224): {diff_before_large:.6f}")
     print(f"Val difference before optimization (16x16): {val_diff_before_small:.6f}")
