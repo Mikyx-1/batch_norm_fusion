@@ -3,7 +3,7 @@
 # Date: May 16, 2025
 # Description:
 # This script demonstrates fusing a Conv2d and BatchNorm2d layer and optimizing
-# the fused weights using torch.optim to match the original output.
+# the fused weights using torch.optim over a batch of inputs to ensure objectivity.
 # License: MIT License
 # ------------------------------------------------------------
 import torch
@@ -23,87 +23,70 @@ def fuse_conv_and_bn(conv, bn):
     Returns:
         torch.nn.Conv2d: The fused convolutional layer.
     """
-    # Try PyTorch's built-in fusion for standard convolutions
-    if conv.groups == 1:
-        try:
-            from torch.nn.utils import fuse_conv_bn_eval
+    with torch.no_grad():
+        # Try PyTorch's built-in fusion
+        if conv.groups == 1:
+            try:
+                from torch.nn.utils import fuse_conv_bn_eval
 
-            return fuse_conv_bn_eval(conv, bn)
-        except ImportError:
-            pass  # Fall back to custom fusion if utility is unavailable
+                return fuse_conv_bn_eval(conv, bn)
+            except ImportError:
+                pass
 
-    # Custom fusion for grouped convolutions or if PyTorch utility fails
-    fusedconv = torch.nn.Conv2d(
-        in_channels=conv.in_channels,
-        out_channels=conv.out_channels,
-        kernel_size=conv.kernel_size,
-        stride=conv.stride,
-        padding=conv.padding,
-        dilation=conv.dilation,
-        groups=conv.groups,
-        bias=True,
-    ).to(
-        dtype=torch.float64
-    )  # Use double precision
+        fusedconv = torch.nn.Conv2d(
+            in_channels=conv.in_channels,
+            out_channels=conv.out_channels,
+            kernel_size=conv.kernel_size,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=conv.groups,
+            bias=True,
+        ).to(dtype=torch.float64)
 
-    w_conv = conv.weight.clone().to(dtype=torch.float64)
-    if conv.groups > 1:
-        # Process grouped convolutions group-wise
-        fused_weight = torch.zeros_like(w_conv, dtype=torch.float64)
-        group_size = conv.out_channels // conv.groups
-        for g in range(conv.groups):
-            w_conv_g = w_conv[g * group_size : (g + 1) * group_size]
-            w_bn_g = torch.diag(
-                bn.weight[g * group_size : (g + 1) * group_size]
-                .to(dtype=torch.float64)
-                .div(
-                    torch.sqrt(
-                        bn.running_var[g * group_size : (g + 1) * group_size].to(
-                            dtype=torch.float64
-                        )
-                        + bn.eps
-                        + 1e-4
-                    )
-                )
+        w_conv = conv.weight.clone().to(dtype=torch.float64)
+        bn_eps = 1e-12
+
+        var_stable = (
+            torch.log1p(bn.running_var.to(dtype=torch.float64).clamp(min=0)) + bn_eps
+        )
+        scale_factor = bn.weight.to(dtype=torch.float64) / torch.sqrt(var_stable)
+
+        if conv.groups > 1:
+            fused_weight = torch.zeros_like(w_conv, dtype=torch.float64)
+            group_size = conv.out_channels // conv.groups
+            for g in range(conv.groups):
+                w_conv_g = w_conv[g * group_size : (g + 1) * group_size]
+                w_bn_g = torch.diag(scale_factor[g * group_size : (g + 1) * group_size])
+                fused_weight[g * group_size : (g + 1) * group_size] = torch.matmul(
+                    w_bn_g, w_conv_g.view(group_size, -1)
+                ).view_as(w_conv_g)
+        else:
+            w_bn = torch.diag(scale_factor)
+            fused_weight = torch.matmul(w_bn, w_conv.view(conv.out_channels, -1)).view(
+                fusedconv.weight.size()
             )
-            fused_weight[g * group_size : (g + 1) * group_size] = torch.mm(
-                w_bn_g, w_conv_g.view(group_size, -1)
-            ).view_as(w_conv_g)
-    else:
-        # Regular convolution
-        w_bn = torch.diag(
-            bn.weight.to(dtype=torch.float64).div(
-                torch.sqrt(bn.running_var.to(dtype=torch.float64) + bn.eps + 1e-4)
+
+        fused_weight = torch.tanh(fused_weight / 1e4) * 1e4
+        fusedconv.weight.copy_(fused_weight)
+
+        if conv.bias is not None:
+            b_conv = conv.bias.clone().to(dtype=torch.float64)
+        else:
+            b_conv = torch.zeros(
+                conv.out_channels, device=conv.weight.device, dtype=torch.float64
             )
-        )
-        fused_weight = torch.mm(w_bn, w_conv.view(conv.out_channels, -1)).view(
-            fusedconv.weight.size()
-        )
 
-    fusedconv.weight.copy_(
-        fused_weight.to(dtype=torch.float32)
-    )  # Convert back to float32
+        b_bn = bn.bias.to(dtype=torch.float64) - bn.weight.to(dtype=torch.float64).mul(
+            bn.running_mean.to(dtype=torch.float64)
+        ).div(torch.sqrt(var_stable))
+        fused_bias = torch.matmul(w_bn, b_conv.unsqueeze(1)).squeeze() + b_bn
+        fused_bias = torch.tanh(fused_bias / 1e4) * 1e4
+        fusedconv.bias.copy_(fused_bias)
 
-    if conv.bias is not None:
-        b_conv = conv.bias.clone().to(dtype=torch.float64)
-    else:
-        b_conv = torch.zeros(
-            conv.out_channels, device=conv.weight.device, dtype=torch.float64
-        )
-
-    b_bn = bn.bias.to(dtype=torch.float64) - bn.weight.to(dtype=torch.float64).mul(
-        bn.running_mean.to(dtype=torch.float64)
-    ).div(torch.sqrt(bn.running_var.to(dtype=torch.float64) + bn.eps + 1e-4))
-    fusedconv.bias.copy_(
-        (torch.matmul(w_bn, b_conv.unsqueeze(1)).squeeze() + b_bn).to(
-            dtype=torch.float32
-        )
-    )
-
-    return fusedconv.to(dtype=torch.float32)
+    return fusedconv
 
 
-# Define a simple Conv + BN model
 class ConvBNModel(nn.Module):
     def __init__(self):
         super(ConvBNModel, self).__init__()
@@ -123,67 +106,188 @@ class ConvBNModel(nn.Module):
         return x
 
 
-# Main experiment
 def main():
-    # Set random seed for reproducibility
     torch.manual_seed(42)
 
-    # Initialize model and stabilize BN statistics
     model = ConvBNModel().eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
     # Stabilize BN with normalized inputs
     for _ in range(100):
-        input_tensor = torch.randn(1, 3, 32, 32, device=device)
-        input_tensor = input_tensor / (input_tensor.abs().max() + 1e-10)
+        input_tensor = torch.randn(64, 3, 16, 16, device=device)
+        input_tensor = input_tensor / (
+            torch.amax(input_tensor.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
+        )
         model(input_tensor)
 
-    # Create test input
-    test_input = torch.randn(1, 3, 224, 224, device=device)
-    test_input = test_input / (test_input.abs().max() + 1e-10)
+    # Create training batch
+    batch_size = 64
+    train_inputs_small = torch.randn(batch_size, 3, 16, 16, device=device)
+    train_inputs_small = train_inputs_small / (
+        torch.amax(train_inputs_small.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
+    )
+    train_inputs_large = torch.randn(batch_size, 3, 224, 224, device=device)
+    train_inputs_large = train_inputs_large / (
+        torch.amax(train_inputs_large.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
+    )
 
-    # Get original output
+    # Create validation batch
+    val_inputs_small = torch.randn(batch_size, 3, 16, 16, device=device)
+    val_inputs_small = val_inputs_small / (
+        torch.amax(val_inputs_small.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
+    )
+    val_inputs_large = torch.randn(batch_size, 3, 224, 224, device=device)
+    val_inputs_large = val_inputs_large / (
+        torch.amax(val_inputs_large.abs(), dim=(1, 2, 3), keepdim=True) + 1e-10
+    )
+
+    # Get original outputs
     with torch.no_grad():
-        original_output = model(test_input)
+        original_outputs_small = model(train_inputs_small)
+        original_outputs_large = model(train_inputs_large)
+        val_original_small = model(val_inputs_small)
+        val_original_large = model(val_inputs_large)
 
-    # Fuse Conv and BN
     fused_layer = fuse_conv_and_bn(model.conv, model.bn)
     fused_layer.eval()
     fused_layer.to(device)
 
     # Get output before optimization
     with torch.no_grad():
-        fused_output = fused_layer(test_input)
-    diff_before = torch.linalg.norm(original_output - fused_output)
-    print(f"Output difference before optimization: {diff_before:.6f}")
+        fused_outputs_small = fused_layer(train_inputs_small)
+        fused_outputs_large = fused_layer(train_inputs_large)
+        val_fused_small = fused_layer(val_inputs_small)
+        val_fused_large = fused_layer(val_inputs_large)
+    diff_before_small = (
+        torch.linalg.norm(original_outputs_small - fused_outputs_small) / batch_size
+    )
+    diff_before_large = (
+        torch.linalg.norm(original_outputs_large - fused_outputs_large) / batch_size
+    )
+    val_diff_before_small = (
+        torch.linalg.norm(val_original_small - val_fused_small) / batch_size
+    )
+    val_diff_before_large = (
+        torch.linalg.norm(val_original_large - val_fused_large) / batch_size
+    )
+    print(f"Train difference before optimization (16x16): {diff_before_small:.6f}")
+    print(f"Train difference before optimization (224x224): {diff_before_large:.6f}")
+    print(f"Val difference before optimization (16x16): {val_diff_before_small:.6f}")
+    print(f"Val difference before optimization (224x224): {val_diff_before_large:.6f}")
 
     # Optimize fused layer
+    fused_layer = fused_layer.to(dtype=torch.float64)
     fused_layer.weight.requires_grad_(True)
     fused_layer.bias.requires_grad_(True)
-    optimizer = optim.Adam([fused_layer.weight, fused_layer.bias], lr=1e-12)
-    num_iterations = 1000
+    initial_weight = fused_layer.weight.clone().detach()
+    initial_bias = fused_layer.bias.clone().detach()
+    optimizer = optim.LBFGS(
+        [fused_layer.weight, fused_layer.bias],
+        lr=1e-4,
+        max_iter=20,
+        line_search_fn="strong_wolfe",
+    )
 
-    for i in range(num_iterations):
+    def closure():
         optimizer.zero_grad()
-        fused_output = fused_layer(test_input)
-        loss = torch.linalg.norm(fused_output - original_output)
+        fused_outputs = fused_layer(train_inputs_small)
+        fused_outputs_norm = fused_outputs / (
+            fused_outputs.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+        )
+        original_outputs_norm = original_outputs_small / (
+            original_outputs_small.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+        )
+        loss_output = (
+            torch.linalg.norm(fused_outputs_norm - original_outputs_norm) / batch_size
+        )
+        loss_weight = 1e-3 * torch.linalg.norm(fused_layer.weight - initial_weight)
+        loss_bias = 1e-3 * torch.linalg.norm(fused_layer.bias - initial_bias)
+        loss = loss_output + loss_weight + loss_bias
         loss.backward()
-        optimizer.step()
-        if i % 10 == 0:
-            print(f"Iteration {i}, Loss: {loss.item():.6f}")
+        return loss
+
+    num_iterations = 1000
+    for i in range(num_iterations):
+        optimizer.step(closure)
+        with torch.no_grad():
+            fused_outputs = fused_layer(train_inputs_small)
+            fused_outputs_norm = fused_outputs / (
+                fused_outputs.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+            )
+            original_outputs_norm = original_outputs_small / (
+                original_outputs_small.norm(dim=(1, 2, 3), keepdim=True) + 1e-10
+            )
+            loss_output = (
+                torch.linalg.norm(fused_outputs_norm - original_outputs_norm)
+                / batch_size
+            )
+        if i % 100 == 0:
+            print(f"Iteration {i}, Output Loss: {loss_output.item():.6f}")
+
+    # Convert to float32
+    with torch.no_grad():
+        fused_layer = fused_layer.to(dtype=torch.float32)
+        fused_layer.weight.copy_(fused_layer.weight.to(dtype=torch.float32))
+        fused_layer.bias.copy_(fused_layer.bias.to(dtype=torch.float32))
+        print(
+            f"Weight dtype: {fused_layer.weight.dtype}, Bias dtype: {fused_layer.bias.dtype}"
+        )
+
+    fused_layer.weight.requires_grad_(False)
+    fused_layer.bias.requires_grad_(False)
 
     # Get output after optimization
     with torch.no_grad():
-        fused_output = fused_layer(test_input)
-    diff_after = torch.linalg.norm(original_output - fused_output)
-    print(f"Output difference after optimization: {diff_after:.6f}")
+        train_inputs_small = train_inputs_small.to(dtype=torch.float32)
+        train_inputs_large = train_inputs_large.to(dtype=torch.float32)
+        val_inputs_small = val_inputs_small.to(dtype=torch.float32)
+        val_inputs_large = val_inputs_large.to(dtype=torch.float32)
+        fused_outputs_small = fused_layer(train_inputs_small)
+        fused_outputs_large = fused_layer(train_inputs_large)
+        val_fused_small = fused_layer(val_inputs_small)
+        val_fused_large = fused_layer(val_inputs_large)
+    diff_after_small = (
+        torch.linalg.norm(
+            original_outputs_small.to(dtype=torch.float32) - fused_outputs_small
+        )
+        / batch_size
+    )
+    diff_after_large = (
+        torch.linalg.norm(
+            original_outputs_large.to(dtype=torch.float32) - fused_outputs_large
+        )
+        / batch_size
+    )
+    val_diff_after_small = (
+        torch.linalg.norm(val_original_small.to(dtype=torch.float32) - val_fused_small)
+        / batch_size
+    )
+    val_diff_after_large = (
+        torch.linalg.norm(val_original_large.to(dtype=torch.float32) - val_fused_large)
+        / batch_size
+    )
+    print(f"Train difference after optimization (16x16): {diff_after_small:.6f}")
+    print(f"Train difference after optimization (224x224): {diff_after_large:.6f}")
+    print(f"Val difference after optimization (16x16): {val_diff_after_small:.6f}")
+    print(f"Val difference after optimization (224x224): {val_diff_after_large:.6f}")
 
-    # Verify if difference is less than 1e-6
-    if diff_after < 1e-6:
-        print("Success: Output difference is less than 1e-6!")
+    if diff_after_small < 1e-6:
+        print("Success: Train difference (16x16) is less than 1e-6!")
     else:
-        print("Warning: Output difference is still above 1e-6.")
+        print("Warning: Train difference (16x16) is still above 1e-6.")
+    if diff_after_large < 1e-6:
+        print("Success: Train difference (224x224) is less than 1e-6!")
+    else:
+        print("Warning: Train difference (224x224) is still above 1e-6.")
+    if val_diff_after_small < 1e-6:
+        print("Success: Val difference (16x16) is less than 1e-6!")
+    else:
+        print("Warning: Val difference (16x16) is still above 1e-6.")
+    if val_diff_after_large < 1e-6:
+        print("Success: Val difference (224x224) is less than 1e-6!")
+    else:
+        print("Warning: Val difference (224x224) is still above 1e-6.")
 
 
 if __name__ == "__main__":
