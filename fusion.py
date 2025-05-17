@@ -11,6 +11,7 @@ import functools
 from copy import deepcopy
 
 import torch
+import torch.nn as nn
 from colorama import Fore, Style
 from torch import nn
 from tqdm import tqdm
@@ -38,7 +39,8 @@ def fuse_conv_and_bn(conv, bn):
             except ImportError:
                 pass
 
-        fusedconv = torch.nn.Conv2d(
+        # Create a new Conv2d layer with the same parameters, ensuring bias=True
+        fusedconv = nn.Conv2d(
             in_channels=conv.in_channels,
             out_channels=conv.out_channels,
             kernel_size=conv.kernel_size,
@@ -47,58 +49,62 @@ def fuse_conv_and_bn(conv, bn):
             dilation=conv.dilation,
             groups=conv.groups,
             bias=True,
-        ).to(dtype=torch.float64)
+        ).to(device=conv.weight.device, dtype=torch.float32)
 
-        w_conv = conv.weight.clone().to(dtype=torch.float64)
-        bn_eps = bn.eps  # Use BatchNorm2d's eps (e.g., 1e-05)
+        # Clone convolution weights and BN parameters, ensure consistent device
+        w_conv = conv.weight.clone().to(device=conv.weight.device, dtype=torch.float32)
+        bn_eps = bn.eps
+        bn_var = bn.running_var.to(device=conv.weight.device, dtype=torch.float32)
+        bn_mean = bn.running_mean.to(device=conv.weight.device, dtype=torch.float32)
+        bn_weight = bn.weight.to(device=conv.weight.device, dtype=torch.float32)
+        bn_bias = bn.bias.to(device=conv.weight.device, dtype=torch.float32)
 
-        # Stabilize variance with log1p
-        var_stable = (
-            torch.log1p(bn.running_var.to(dtype=torch.float64).clamp(min=0)) + bn_eps
-        )
-        scale_factor = bn.weight.to(dtype=torch.float64) / torch.sqrt(var_stable)
+        # Compute scale factor: gamma / sqrt(var + eps)
+        scale_factor = bn_weight / torch.sqrt(bn_var + bn_eps)
 
+        # Handle weights
         if conv.groups > 1:
-            fused_weight = torch.zeros_like(w_conv, dtype=torch.float64)
+            # For grouped convolutions, apply scale factor per group
             group_size = conv.out_channels // conv.groups
+            fused_weight = w_conv.clone()
             for g in range(conv.groups):
-                w_conv_g = w_conv[g * group_size : (g + 1) * group_size]
-                w_bn_g = torch.diag(scale_factor[g * group_size : (g + 1) * group_size])
-                fused_weight[g * group_size : (g + 1) * group_size] = torch.matmul(
-                    w_bn_g, w_conv_g.view(group_size, -1)
-                ).view_as(w_conv_g)
+                # Apply scale factor to each group's weights
+                group_scale = scale_factor[g * group_size : (g + 1) * group_size].view(
+                    -1, 1, 1, 1
+                )
+                fused_weight[g * group_size : (g + 1) * group_size] *= group_scale
         else:
-            w_bn = torch.diag(scale_factor)
-            fused_weight = torch.matmul(w_bn, w_conv.view(conv.out_channels, -1)).view(
-                fusedconv.weight.size()
-            )
+            # For standard convolutions, apply scale factor across all output channels
+            scale_diag = torch.diag(scale_factor)
+            fused_weight = torch.matmul(
+                scale_diag, w_conv.view(conv.out_channels, -1)
+            ).view_as(w_conv)
 
-        # Clamp weights
-        fused_weight = torch.tanh(fused_weight / 1e4) * 1e4
-        fusedconv.weight.copy_(fused_weight.to(dtype=torch.float32))
+        fusedconv.weight.copy_(fused_weight)
 
+        # Handle biases
         if conv.bias is not None:
-            b_conv = conv.bias.clone().to(dtype=torch.float64)
+            b_conv = conv.bias.clone().to(
+                device=conv.weight.device, dtype=torch.float32
+            )
         else:
             b_conv = torch.zeros(
-                conv.out_channels, device=conv.weight.device, dtype=torch.float64
+                conv.out_channels, device=conv.weight.device, dtype=torch.float32
             )
 
-        b_bn = bn.bias.to(dtype=torch.float64) - bn.weight.to(dtype=torch.float64).mul(
-            bn.running_mean.to(dtype=torch.float64)
-        ).div(torch.sqrt(var_stable))
+        # BN bias contribution: (bn_bias - bn_weight * bn_mean / sqrt(var + eps))
+        b_bn = bn_bias - bn_weight * bn_mean / torch.sqrt(bn_var + bn_eps)
 
         if conv.groups > 1:
-            # For grouped convolutions, apply scale_factor directly to bias
+            # For grouped convolutions, scale the convolution bias and add BN bias
             fused_bias = scale_factor * b_conv + b_bn
         else:
-            fused_bias = torch.matmul(w_bn, b_conv.unsqueeze(1)).squeeze() + b_bn
+            # For standard convolutions, apply scale factor matrix to bias
+            fused_bias = torch.matmul(scale_diag, b_conv.unsqueeze(1)).squeeze(1) + b_bn
 
-        # Clamp bias
-        fused_bias = torch.tanh(fused_bias / 1e4) * 1e4
-        fusedconv.bias.copy_(fused_bias.to(dtype=torch.float32))
+        fusedconv.bias.copy_(fused_bias)
 
-        return fusedconv.to(dtype=torch.float32)
+        return fusedconv
 
 
 def find_conv_bn_pairs(traced_model):
@@ -247,7 +253,7 @@ def fuse(model):
 if __name__ == "__main__":
     import torchvision.models
 
-    model = torchvision.models.resnet152(weights=None)
+    model = torchvision.models.efficientnet_b7(weights=None)
     model.eval()
     fused_model = fuse(model)
     fused_model.eval()
