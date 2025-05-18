@@ -16,6 +16,8 @@ from colorama import Fore, Style
 from torch import nn
 from tqdm import tqdm
 
+torch.manual_seed(42)
+
 
 def fuse_conv_and_bn(conv, bn):
     """
@@ -253,7 +255,7 @@ def fuse(model):
 if __name__ == "__main__":
     import torchvision.models
 
-    model = torchvision.models.efficientnet_b7(weights=None)
+    model = torchvision.models.resnet152(weights=None)
     model.eval()
     fused_model = fuse(model)
     fused_model.eval()
