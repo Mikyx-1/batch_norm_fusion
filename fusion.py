@@ -16,6 +16,8 @@ from colorama import Fore, Style
 from torch import nn
 from tqdm import tqdm
 
+from utils import fuse_conv_bn_eval
+
 torch.manual_seed(42)
 
 
@@ -34,12 +36,7 @@ def fuse_conv_and_bn(conv, bn):
     with torch.no_grad():
         # Try PyTorch's built-in fusion for standard convolutions
         if conv.groups == 1:
-            try:
-                from torch.nn.utils import fuse_conv_bn_eval
-
-                return fuse_conv_bn_eval(conv, bn)
-            except ImportError:
-                pass
+            return fuse_conv_bn_eval(conv, bn)
 
         # Create a new Conv2d layer with the same parameters, ensuring bias=True
         fusedconv = nn.Conv2d(
