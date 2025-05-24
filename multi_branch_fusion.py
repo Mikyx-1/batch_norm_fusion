@@ -1,4 +1,4 @@
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Union
 
 import torch
 import torch.nn as nn
@@ -9,61 +9,53 @@ from fusion import fuse
 torch.set_grad_enabled(False)
 
 
-def extract_bn_conv_pairs(gm: GraphModule) -> Dict[str, List[str]]:
+def extract_batch_norm_inputs(
+    model: torch.nn.Module,
+) -> Dict[str, Union[str, List[str]]]:
     """
-    For each BatchNorm node in the FX graph, walk backwards through its inputs
-    and collect the names of all Conv modules (Conv1d/2d/3d) that eventually
-    feed into it.
+    Extracts batch normalization layers and their input nodes from a PyTorch model's FX graph.
+
+    Args:
+        model: PyTorch model to analyze
 
     Returns:
-        { bn_node_name: [conv_module_name, ...],  ... }
+        Dictionary mapping batch norm layer names to their input node names.
+        If the input is from a cat operation, the value is a list of input node names.
     """
-    modules = dict(gm.named_modules())
-    pairs: Dict[str, List[str]] = {}
+    # Symbolically trace the model
+    traced = torch.fx.symbolic_trace(model)
+    graph = traced.graph
 
-    def find_convs(node: Node, visited: Set[Node]) -> List[str]:
-        if node in visited:
-            return []
-        visited.add(node)
+    # Dictionary to store batch norm layer -> input(s) mapping
+    bn_inputs = {}
 
-        # If this node is directly a conv module call, capture it
-        if node.op == "call_module" and isinstance(
-            modules[node.target], (nn.Conv1d, nn.Conv2d, nn.Conv3d)
-        ):
-            return [node.target]
+    # Iterate through all nodes in the graph
+    for node in graph.nodes:
+        # Check if the node is a call_module and contains 'norm' in its target
+        if node.op == "call_module" and "norm" in node.target.lower():
+            # Get the input node(s)
+            input_nodes = node.args
 
-        convs: List[str] = []
-        # Otherwise, recurse into all Node args
-        for arg in node.args:
-            if isinstance(arg, Node):
-                convs.extend(find_convs(arg, visited))
-            elif isinstance(arg, (tuple, list)):
-                # if the argument is a list/tuple of nodes, also recurse
-                for elem in arg:
-                    if isinstance(elem, Node):
-                        convs.extend(find_convs(elem, visited))
+            if len(input_nodes) == 1:
+                input_node = input_nodes[0]
 
-        return convs
+                # Check if the input node is a cat operation
+                if (
+                    input_node.op == "call_function"
+                    and "cat" in str(input_node.target).lower()
+                ):
+                    # Get all inputs to the cat operation
+                    cat_inputs = input_node.args[0]  # First arg is the list of tensors
+                    # Store the list of input node names
+                    bn_inputs[node.target] = [str(inp) for inp in cat_inputs]
+                else:
+                    # Single input case
+                    bn_inputs[node.target] = str(input_node)
+            else:
+                # Handle unexpected cases (though not present in the example)
+                bn_inputs[node.target] = [str(inp) for inp in input_nodes]
 
-    for node in gm.graph.nodes:
-        # find every BatchNorm node
-        if node.op == "call_module" and isinstance(
-            modules[node.target], (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
-        ):
-            bn_name = node.name
-            # start traversal from its first input
-            start = node.args[0]
-            conv_names = find_convs(start, set())
-            # dedupe while preserving order
-            seen = set()
-            conv_list = []
-            for c in conv_names:
-                if c not in seen:
-                    seen.add(c)
-                    conv_list.append(c)
-            pairs[bn_name] = conv_list
-
-    return pairs
+    return bn_inputs
 
 
 class Model(nn.Module):
