@@ -201,9 +201,10 @@ def fuse(model):
         nn.Module: A fused model with BatchNorm layers merged into Conv layers.
     """
     model.eval()
-    device = next(model.parameters()).device
-    for _ in range(10):
-        model(torch.randn(1, 3, 224, 224, device=device))
+    # TODO: Why not running this loop results in smaller error (ResNet152)?
+    # device = next(model.parameters()).device
+    # for _ in range(10):
+    #     model(torch.randn(1, 3, 224, 224, device=device))
 
     print(
         f"{Fore.GREEN}Process started: Fusing BatchNorm layers into Conv layers.{Style.RESET_ALL}"
