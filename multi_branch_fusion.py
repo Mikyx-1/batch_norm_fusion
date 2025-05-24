@@ -1,10 +1,69 @@
+from typing import Dict, List, Set
+
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.fx import GraphModule, Node
 
 from fusion import fuse
 
 torch.set_grad_enabled(False)
+
+
+def extract_bn_conv_pairs(gm: GraphModule) -> Dict[str, List[str]]:
+    """
+    For each BatchNorm node in the FX graph, walk backwards through its inputs
+    and collect the names of all Conv modules (Conv1d/2d/3d) that eventually
+    feed into it.
+
+    Returns:
+        { bn_node_name: [conv_module_name, ...],  ... }
+    """
+    modules = dict(gm.named_modules())
+    pairs: Dict[str, List[str]] = {}
+
+    def find_convs(node: Node, visited: Set[Node]) -> List[str]:
+        if node in visited:
+            return []
+        visited.add(node)
+
+        # If this node is directly a conv module call, capture it
+        if node.op == "call_module" and isinstance(
+            modules[node.target], (nn.Conv1d, nn.Conv2d, nn.Conv3d)
+        ):
+            return [node.target]
+
+        convs: List[str] = []
+        # Otherwise, recurse into all Node args
+        for arg in node.args:
+            if isinstance(arg, Node):
+                convs.extend(find_convs(arg, visited))
+            elif isinstance(arg, (tuple, list)):
+                # if the argument is a list/tuple of nodes, also recurse
+                for elem in arg:
+                    if isinstance(elem, Node):
+                        convs.extend(find_convs(elem, visited))
+
+        return convs
+
+    for node in gm.graph.nodes:
+        # find every BatchNorm node
+        if node.op == "call_module" and isinstance(
+            modules[node.target], (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+        ):
+            bn_name = node.name
+            # start traversal from its first input
+            start = node.args[0]
+            conv_names = find_convs(start, set())
+            # dedupe while preserving order
+            seen = set()
+            conv_list = []
+            for c in conv_names:
+                if c not in seen:
+                    seen.add(c)
+                    conv_list.append(c)
+            pairs[bn_name] = conv_list
+
+    return pairs
 
 
 class Model(nn.Module):
@@ -52,8 +111,11 @@ class Model(nn.Module):
 
 
 if __name__ == "__main__":
-    model = Model(in_channels=3)
-    model.eval()
+    import torchvision
 
-    traced = torch.fx.symbolic_trace(model)
-    print(f"traced: {traced.graph.print_tabular()}")
+    model = Model(in_channels=3)
+    # model = torchvision.models.resnet18(weights=None)
+    model.eval()
+    gm = torch.fx.symbolic_trace(model)
+    pairs = extract_bn_conv_pairs(gm)
+    print(pairs)
