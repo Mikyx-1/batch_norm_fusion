@@ -31,29 +31,38 @@ def extract_batch_norm_inputs(
 
     # Iterate through all nodes in the graph
     for node in graph.nodes:
-        # Check if the node is a call_module and contains 'norm' in its target
-        if node.op == "call_module" and "norm" in node.target.lower():
-            # Get the input node(s)
-            input_nodes = node.args
+        # Check if the node is a call_module and its target is a batch norm layer
+        if node.op == "call_module":
+            module = traced
+            for part in node.target.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            # Check if the module is a batch norm layer
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                # Get the input node(s)
+                input_nodes = node.args
 
-            if len(input_nodes) == 1:
-                input_node = input_nodes[0]
+                if len(input_nodes) == 1:
+                    input_node = input_nodes[0]
 
-                # Check if the input node is a cat operation
-                if (
-                    input_node.op == "call_function"
-                    and "cat" in str(input_node.target).lower()
-                ):
-                    # Get all inputs to the cat operation
-                    cat_inputs = input_node.args[0]  # First arg is the list of tensors
-                    # Store the list of input node names
-                    bn_inputs[node.target] = [str(inp) for inp in cat_inputs]
+                    # Check if the input node is a cat operation
+                    if (
+                        input_node.op == "call_function"
+                        and "cat" in str(input_node.target).lower()
+                    ):
+                        # Get all inputs to the cat operation
+                        cat_inputs = input_node.args[
+                            0
+                        ]  # First arg is the list of tensors
+                        # Store the list of input node names
+                        bn_inputs[node.target] = [str(inp) for inp in cat_inputs]
+                    else:
+                        # Single input case
+                        bn_inputs[node.target] = str(input_node)
                 else:
-                    # Single input case
-                    bn_inputs[node.target] = str(input_node)
-            else:
-                # Handle unexpected cases (though not present in the example)
-                bn_inputs[node.target] = [str(inp) for inp in input_nodes]
+                    # Handle unexpected cases with multiple inputs
+                    bn_inputs[node.target] = [str(inp) for inp in input_nodes]
 
     return bn_inputs
 
